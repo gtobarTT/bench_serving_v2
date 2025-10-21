@@ -1,0 +1,13 @@
+# Core dependencies for benchmark_serving
+aiohttp
+huggingface_hub
+tqdm
+transformers
+numpy
+pandas
+datasets
+Pillow
+
+# Optional but recommended
+#vllm
+
