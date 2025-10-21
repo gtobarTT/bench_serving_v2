@@ -697,6 +697,43 @@ async def benchmark(
                                      pbar=pbar)))
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
 
+    # Calculate max output tokens per second and peak concurrent requests
+    max_output_tokens_per_s = 0.0
+    max_concurrent_requests = 0
+    successful_indices = [i for i, o in enumerate(outputs) if o.success]
+    if successful_indices:
+        min_start_time = min(outputs[i].start_time for i in successful_indices)
+        max_end_time = max(outputs[i].start_time + outputs[i].latency
+                           for i in successful_indices)
+        duration_seconds = int(np.ceil(max_end_time - min_start_time)) + 1
+        tokens_per_second = np.zeros(duration_seconds)
+        concurrent_requests_per_second = np.zeros(duration_seconds)
+
+        for i in successful_indices:
+            output = outputs[i]
+            st = output.start_time
+            # Token emission timestamps
+            token_times = [st + output.ttft]
+            current_time = token_times[0]
+            for itl_value in output.itl:
+                current_time += itl_value
+                token_times.append(current_time)
+
+            for token_time in token_times:
+                second_bucket = int(token_time - min_start_time)
+                if 0 <= second_bucket < duration_seconds:
+                    tokens_per_second[second_bucket] += 1
+
+            request_start_second = int(st - min_start_time)
+            request_end_second = int((st + output.latency) - min_start_time)
+            for second in range(request_start_second, request_end_second + 1):
+                if 0 <= second < duration_seconds:
+                    concurrent_requests_per_second[second] += 1
+
+        if len(tokens_per_second) > 0:
+            max_output_tokens_per_s = float(np.max(tokens_per_second))
+            max_concurrent_requests = int(np.max(concurrent_requests_per_second))
+
     if profile:
         print("Stopping profiler...")
         profile_input = RequestFuncInput(
@@ -741,6 +778,10 @@ async def benchmark(
                                         metrics.request_goodput))
     print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):",
                                     metrics.output_throughput))
+    print("{:<40} {:<10.2f}".format("Peak output token throughput (tok/s):",
+                                    max_output_tokens_per_s))
+    print("{:<40} {:<10.2f}".format("Peak concurrent requests:",
+                                    max_concurrent_requests))
     print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):",
                                     metrics.total_token_throughput))
 
@@ -760,6 +801,8 @@ async def benchmark(
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "max_output_tokens_per_s": max_output_tokens_per_s,
+        "max_concurrent_requests": max_concurrent_requests,
     }
 
     def process_one_metric(
@@ -1045,6 +1088,12 @@ def main(args: argparse.Namespace):
             file_name = args.result_filename
         if args.result_dir:
             file_name = os.path.join(args.result_dir, file_name)
+        
+        # Create directory if it doesn't exist
+        result_dir = os.path.dirname(file_name)
+        if result_dir:
+            os.makedirs(result_dir, exist_ok=True)
+        
         with open(file_name, "w", encoding='utf-8') as outfile:
             json.dump(result_json, outfile)
         save_to_pytorch_benchmark_format(args, result_json, file_name)
