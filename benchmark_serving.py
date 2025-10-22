@@ -565,7 +565,7 @@ def calculate_metrics(
             current_time = token_times[0]
             for itl_value in output.itl:
                 current_time += itl_value
-                if current_time > first_token_time:
+                if current_time > first_token_time: #redundant check
                     token_times.append(current_time)
 
             for token_time in token_times:
