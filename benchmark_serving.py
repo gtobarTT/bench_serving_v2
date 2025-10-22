@@ -57,7 +57,7 @@ except ImportError:
     from argparse import ArgumentParser as FlexibleArgumentParser
 
 from benchmark_utils import convert_to_pytorch_benchmark_format
-
+import contextlib
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
 
@@ -89,6 +89,12 @@ class BenchmarkMetrics:
     median_e2el_ms: float
     std_e2el_ms: float
     percentiles_e2el_ms: List[Tuple[float, float]]
+    # Additional metrics
+    actual_output_lens: List[int]
+    max_output_tokens_per_s: float
+    max_concurrent_requests: int
+    output_tokens_per_s: List[float]
+    concurrent_requests_per_s: List[int]
 
 
 def sample_sharegpt_requests(
@@ -471,7 +477,7 @@ def calculate_metrics(
     selected_percentile_metrics: List[str],
     selected_percentiles: List[float],
     goodput_config_dict: Dict[str, float],
-) -> Tuple[BenchmarkMetrics, List[int]]:
+) -> BenchmarkMetrics:
     actual_output_lens: List[int] = []
     total_input = 0
     completed = 0
@@ -537,6 +543,46 @@ def calculate_metrics(
             "All requests failed. This is likely due to a misconfiguration "
             "on the benchmark arguments.",
             stacklevel=2)
+    
+    # Calculate max output tokens per second and peak concurrent requests
+    max_output_tokens_per_s = 0.0
+    max_concurrent_requests = 0
+    successful_indices = [i for i, o in enumerate(outputs) if o.success]
+    if successful_indices:
+        min_start_time = min(outputs[i].start_time for i in successful_indices)
+        max_end_time = max(outputs[i].start_time + outputs[i].latency
+                           for i in successful_indices)
+        duration_seconds = int(np.ceil(max_end_time - min_start_time)) + 1
+        tokens_per_second = np.zeros(duration_seconds)
+        concurrent_requests_per_second = np.zeros(duration_seconds)
+
+        for i in successful_indices:
+            output = outputs[i]
+            st = output.start_time
+            # Token emission timestamps
+            token_times = [st + output.ttft]
+            first_token_time = st + output.ttft
+            current_time = token_times[0]
+            for itl_value in output.itl:
+                current_time += itl_value
+                if current_time > first_token_time:
+                    token_times.append(current_time)
+
+            for token_time in token_times:
+                second_bucket = int(token_time - min_start_time)
+                if 0 <= second_bucket < duration_seconds:
+                    tokens_per_second[second_bucket] += 1
+
+            request_start_second = int(st - min_start_time)
+            request_end_second = int((st + output.latency) - min_start_time)
+            for second in range(request_start_second, request_end_second + 1):
+                if 0 <= second < duration_seconds:
+                    concurrent_requests_per_second[second] += 1
+
+        if len(tokens_per_second) > 0:
+            max_output_tokens_per_s = float(np.max(tokens_per_second))
+            max_concurrent_requests = int(np.max(concurrent_requests_per_second))
+    
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
@@ -566,9 +612,14 @@ def calculate_metrics(
         median_e2el_ms=np.median(e2els or 0) * 1000,
         percentiles_e2el_ms=[(p, np.percentile(e2els or 0, p) * 1000)
                              for p in selected_percentiles],
+        actual_output_lens=actual_output_lens,
+        max_output_tokens_per_s=max_output_tokens_per_s,
+        max_concurrent_requests=max_concurrent_requests,
+        output_tokens_per_s=tokens_per_second,
+        concurrent_requests_per_s=concurrent_requests_per_second,
     )
 
-    return metrics, actual_output_lens
+    return metrics
 
 
 async def benchmark(
@@ -596,14 +647,16 @@ async def benchmark(
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
-
-    print("Starting initial single prompt test run...")
+    
+    
     test_prompt, test_prompt_len, test_output_len, test_mm_content = (
         input_requests[0])
     if backend != "openai-chat" and test_mm_content is not None:
         # multi-modal benchmark is only available on OpenAI Chat backend.
         raise ValueError(
             "Multi-modal content is only supported on 'openai-chat' backend.")
+    
+    
     test_input = RequestFuncInput(
         model=model_id,
         model_name=model_name,
@@ -616,14 +669,28 @@ async def benchmark(
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
     )
+    if max_concurrency:
+        
+        print(f"Starting initial warmup test run with {max_concurrency} concurrent request(s)...")
+        test_pbar = None if disable_tqdm else tqdm(total=max_concurrency)
+        test_semaphore = (asyncio.Semaphore(max_concurrency)
+                    if max_concurrency else contextlib.nullcontext())
+        
+        async def test_limited_request_func():
+            async with test_semaphore:
+                return await request_func(request_func_input=test_input, pbar=test_pbar)
+                
+        test_tasks = []
+        
+        for _ in range(max_concurrency):
+            test_task = asyncio.create_task(test_limited_request_func())
+            test_tasks.append(test_task)
 
-    test_output = await request_func(request_func_input=test_input)
-    if not test_output.success:
-        raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}")
-    else:
-        print("Initial test run completed. Starting main benchmark run...")
+        _ = await asyncio.gather(*test_tasks)
+
+        if test_pbar is not None:
+            test_pbar.close()
+        print(f"Initial warmup test run completed successfully ({max_concurrency} request(s)). Starting main benchmark run...")
 
     if lora_modules:
         # For each input request, choose a LoRA module at random.
@@ -659,10 +726,11 @@ async def benchmark(
 
     # This can be used once the minimum Python version is 3.10 or higher,
     # and it will simplify the code in limited_request_func.
-    #    semaphore = (asyncio.Semaphore(max_concurrency)
-    #                 if max_concurrency else contextlib.nullcontext())
+    
     semaphore = (asyncio.Semaphore(max_concurrency)
-                 if max_concurrency else None)
+                    if max_concurrency else contextlib.nullcontext())
+    # semaphore = (asyncio.Semaphore(max_concurrency)
+    #              if max_concurrency else None)
 
     async def limited_request_func(request_func_input, pbar):
         if semaphore is None:
@@ -696,44 +764,7 @@ async def benchmark(
                 limited_request_func(request_func_input=request_func_input,
                                      pbar=pbar)))
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
-
-    # Calculate max output tokens per second and peak concurrent requests
-    max_output_tokens_per_s = 0.0
-    max_concurrent_requests = 0
-    successful_indices = [i for i, o in enumerate(outputs) if o.success]
-    if successful_indices:
-        min_start_time = min(outputs[i].start_time for i in successful_indices)
-        max_end_time = max(outputs[i].start_time + outputs[i].latency
-                           for i in successful_indices)
-        duration_seconds = int(np.ceil(max_end_time - min_start_time)) + 1
-        tokens_per_second = np.zeros(duration_seconds)
-        concurrent_requests_per_second = np.zeros(duration_seconds)
-
-        for i in successful_indices:
-            output = outputs[i]
-            st = output.start_time
-            # Token emission timestamps
-            token_times = [st + output.ttft]
-            current_time = token_times[0]
-            for itl_value in output.itl:
-                current_time += itl_value
-                token_times.append(current_time)
-
-            for token_time in token_times:
-                second_bucket = int(token_time - min_start_time)
-                if 0 <= second_bucket < duration_seconds:
-                    tokens_per_second[second_bucket] += 1
-
-            request_start_second = int(st - min_start_time)
-            request_end_second = int((st + output.latency) - min_start_time)
-            for second in range(request_start_second, request_end_second + 1):
-                if 0 <= second < duration_seconds:
-                    concurrent_requests_per_second[second] += 1
-
-        if len(tokens_per_second) > 0:
-            max_output_tokens_per_s = float(np.max(tokens_per_second))
-            max_concurrent_requests = int(np.max(concurrent_requests_per_second))
-
+    
     if profile:
         print("Stopping profiler...")
         profile_input = RequestFuncInput(
@@ -754,7 +785,7 @@ async def benchmark(
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
-    metrics, actual_output_lens = calculate_metrics(
+    metrics = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
@@ -779,12 +810,12 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):",
                                     metrics.output_throughput))
     print("{:<40} {:<10.2f}".format("Peak output token throughput (tok/s):",
-                                    max_output_tokens_per_s))
+                                    metrics.max_output_tokens_per_s))
     print("{:<40} {:<10.2f}".format("Peak concurrent requests:",
-                                    max_concurrent_requests))
+                                    metrics.max_concurrent_requests))
     print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):",
                                     metrics.total_token_throughput))
-
+    
     result = {
         "duration": benchmark_duration,
         "completed": metrics.completed,
@@ -796,13 +827,15 @@ async def benchmark(
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
         "input_lens": [output.prompt_len for output in outputs],
-        "output_lens": actual_output_lens,
+        "output_lens": metrics.actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
-        "max_output_tokens_per_s": max_output_tokens_per_s,
-        "max_concurrent_requests": max_concurrent_requests,
+        "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
+        "max_concurrent_requests": metrics.max_concurrent_requests,
+        "output_tokens_per_s": metrics.output_tokens_per_s.tolist(),
+        "concurrent_requests_per_s": metrics.concurrent_requests_per_s.tolist(),
     }
 
     def process_one_metric(
