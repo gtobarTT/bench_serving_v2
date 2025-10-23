@@ -34,7 +34,7 @@ import random
 import time
 import warnings
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime,timezone
 from typing import Any, AsyncGenerator, Collection, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -95,6 +95,7 @@ class BenchmarkMetrics:
     max_concurrent_requests: int
     output_tokens_per_s: List[float]
     concurrent_requests_per_s: List[int]
+    mean_input_tokens_per_s: float
 
 
 def sample_sharegpt_requests(
@@ -487,6 +488,8 @@ def calculate_metrics(
     all_tpots: List[float] = []
     ttfts: List[float] = []
     e2els: List[float] = []
+    input_tokens_per_s: List[float] = []
+    
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_tokens
@@ -502,6 +505,7 @@ def calculate_metrics(
                               add_special_tokens=False).input_ids)
             actual_output_lens.append(output_len)
             total_input += input_requests[i][1]
+            input_tokens_per_s.append(input_requests[i][1] / outputs[i].ttft)
             tpot = 0
             if output_len > 1:
                 latency_minus_ttft = outputs[i].latency - outputs[i].ttft
@@ -617,6 +621,7 @@ def calculate_metrics(
         max_concurrent_requests=max_concurrent_requests,
         output_tokens_per_s=tokens_per_second,
         concurrent_requests_per_s=concurrent_requests_per_second,
+        mean_input_tokens_per_s= np.mean(input_tokens_per_s)
     )
 
     return metrics
@@ -794,7 +799,7 @@ async def benchmark(
         selected_percentiles=selected_percentiles,
         goodput_config_dict=goodput_config_dict,
     )
-
+    
     print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):",
@@ -807,12 +812,14 @@ async def benchmark(
     if goodput_config_dict:
         print("{:<40} {:<10.2f}".format("Request goodput (req/s):",
                                         metrics.request_goodput))
+    print("{:<40} {:<10.2f}".format("Input token throughput (tok/s):", 
+                                    metrics.mean_input_tokens_per_s))
     print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):",
-                                    metrics.output_throughput))
+                                    metrics.output_tokens_per_s[np.nonzero(metrics.output_tokens_per_s)].mean()))
     print("{:<40} {:<10.2f}".format("Peak output token throughput (tok/s):",
                                     metrics.max_output_tokens_per_s))
-    print("{:<40} {:<10.2f}".format("Peak concurrent requests:",
-                                    metrics.max_concurrent_requests))
+    print("{:<40} {:<10.2f}".format("Concurrent requests:",
+                                    pd.Series(metrics.concurrent_requests_per_s).mode()[0]))
     print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):",
                                     metrics.total_token_throughput))
     
@@ -836,6 +843,7 @@ async def benchmark(
         "max_concurrent_requests": metrics.max_concurrent_requests,
         "output_tokens_per_s": metrics.output_tokens_per_s.tolist(),
         "concurrent_requests_per_s": metrics.concurrent_requests_per_s.tolist(),
+        "mean_input_tokens_per_s": metrics.mean_input_tokens_per_s,
     }
 
     def process_one_metric(
@@ -1084,7 +1092,7 @@ def main(args: argparse.Namespace):
         result_json: Dict[str, Any] = {}
 
         # Setup
-        current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+        current_dt = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         result_json["date"] = current_dt
         result_json["backend"] = backend
         result_json["model_id"] = model_id
