@@ -96,7 +96,7 @@ class BenchmarkMetrics:
     output_tokens_per_s: List[float]
     concurrent_requests_per_s: List[int]
     mean_input_tokens_per_s: float
-
+    start_timestamps: List[datetime]
 
 def sample_sharegpt_requests(
     dataset_path: str,
@@ -489,6 +489,7 @@ def calculate_metrics(
     ttfts: List[float] = []
     e2els: List[float] = []
     input_tokens_per_s: List[float] = []
+    start_timestamps: List[datetime] = []
     
     for i in range(len(outputs)):
         if outputs[i].success:
@@ -516,6 +517,7 @@ def calculate_metrics(
             itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
             e2els.append(outputs[i].latency)
+            start_timestamps.append(outputs[i].start_timestamp)
             completed += 1
         else:
             actual_output_lens.append(0)
@@ -621,7 +623,8 @@ def calculate_metrics(
         max_concurrent_requests=max_concurrent_requests,
         output_tokens_per_s=tokens_per_second,
         concurrent_requests_per_s=concurrent_requests_per_second,
-        mean_input_tokens_per_s= np.mean(input_tokens_per_s)
+        mean_input_tokens_per_s= np.mean(input_tokens_per_s),
+        start_timestamps=start_timestamps
     )
 
     return metrics
@@ -844,6 +847,7 @@ async def benchmark(
         "output_tokens_per_s": metrics.output_tokens_per_s.tolist(),
         "concurrent_requests_per_s": metrics.concurrent_requests_per_s.tolist(),
         "mean_input_tokens_per_s": metrics.mean_input_tokens_per_s,
+        "start_timestamps": metrics.start_timestamps,
     }
 
     def process_one_metric(

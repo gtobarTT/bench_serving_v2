@@ -7,7 +7,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from typing import List, Optional, Union
-
+from datetime import datetime,timezone
 import aiohttp
 import huggingface_hub.constants
 from tqdm.asyncio import tqdm
@@ -45,7 +45,7 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
     start_time: float = 0.0
-
+    start_timestamp: datetime = datetime.now(timezone.utc)
 
 async def async_request_tgi(
     request_func_input: RequestFuncInput,
@@ -74,6 +74,7 @@ async def async_request_tgi(
 
         ttft = 0.0
         st = time.perf_counter()
+        output.start_timestamp = datetime.now(timezone.utc)
         output.start_time = st
         most_recent_timestamp = st
         try:
@@ -272,6 +273,7 @@ async def async_request_openai_completions(
 
         generated_text = ""
         st = time.perf_counter()
+        output.start_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
         output.start_time = st
         most_recent_timestamp = st
         try:
