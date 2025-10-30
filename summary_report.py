@@ -201,9 +201,7 @@ def process_benchmark_file(filepath: str) -> Dict[str, Any]:
         # Filter out zero values and get the mode
         concurrent_vals = [c for c in data["concurrent_requests_per_s"] if c > 0]
         if concurrent_vals:
-            actual_max_con = mode(concurrent_vals)
-        else:
-            actual_max_con = min(params["max_con"], params["num_requests"])
+            actual_max_con = int(min(mode(concurrent_vals), params["max_con"], params["num_requests"]))
     else:
         actual_max_con = min(params["max_con"], params["num_requests"])
     
