@@ -51,6 +51,47 @@ def generate_random_audio(duration_ms, sample_rate=16000):
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
 
+class StreamedResponseHandler:
+    """Handles streaming HTTP responses by accumulating chunks until complete
+    messages are available."""
+
+    def __init__(self):
+        self.buffer = ""
+
+    def add_chunk(self, chunk_bytes: bytes) -> list[str]:
+        """Add a chunk of bytes to the buffer and return any complete
+        messages."""
+        chunk_str = chunk_bytes.decode("utf-8")
+        self.buffer += chunk_str
+
+        messages = []
+
+        # Split by double newlines (SSE message separator)
+        while "\n\n" in self.buffer:
+            message, self.buffer = self.buffer.split("\n\n", 1)
+            message = message.strip()
+            if message:
+                messages.append(message)
+
+        # if self.buffer is not empty, check if it is a complete message
+        # by removing data: prefix and check if it is a valid JSON
+        if self.buffer.startswith("data: "):
+            message_content = self.buffer.removeprefix("data: ").strip()
+            if message_content == "[DONE]":
+                messages.append(self.buffer.strip())
+                self.buffer = ""
+            elif message_content:
+                try:
+                    json.loads(message_content)
+                    messages.append(self.buffer.strip())
+                    self.buffer = ""
+                except json.JSONDecodeError:
+                    # Incomplete JSON, wait for more chunks.
+                    pass
+
+        return messages
+
+
 @dataclass
 class WhisperRequestInput:
     audio_file_path: str  # Path to audio file
@@ -79,126 +120,129 @@ class WhisperRequestOutput:
 
 async def async_request_openai_whisper(
     request_input: WhisperRequestInput,
+    session: Optional[aiohttp.ClientSession] = None,
 ) -> WhisperRequestOutput:
-    """
-    Async function to request Whisper transcription with streaming support.
-    Similar to async_request_openai_completions but for audio transcription.
-    """
+    """Async function to request Whisper transcription using official vLLM logic."""
+    import soundfile
+
     api_url = request_input.api_url
+
+    client_session = session
+    owns_session = client_session is None
+    if owns_session:
+        client_session = aiohttp.ClientSession(trust_env=True,
+                                               timeout=AIOHTTP_TIMEOUT)
+
+    output = WhisperRequestOutput()
     
-    async with aiohttp.ClientSession(trust_env=True,
-                                     timeout=AIOHTTP_TIMEOUT) as session:
-        output = WhisperRequestOutput()
-        
+
+    def to_bytes_from_path(path: str) -> io.BytesIO:
+        data, sample_rate = soundfile.read(path)
+        buffer = io.BytesIO()
+        soundfile.write(buffer, data, sample_rate, format="WAV")
+        buffer.seek(0)
+        return buffer
+
+    form_audio = None
+    try:
+        form = aiohttp.FormData()
+
+        form_audio = to_bytes_from_path(request_input.audio_file_path)
+        form.add_field(
+            "file",
+            form_audio,
+            filename=os.path.basename(request_input.audio_file_path),
+            content_type="audio/wav",
+        )
+
+        payload = {
+            "model": request_input.model_name
+            if request_input.model_name
+            else request_input.model,
+            "temperature": request_input.temperature,
+            "response_format": request_input.response_format,
+            "stream": request_input.stream,
+            "language": request_input.language,
+            "stream_include_usage": True,
+            "stream_continuous_usage_stats": True,
+        }
+
+        for key, value in payload.items():
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                form.add_field(key, "true" if value else "false")
+            else:
+                form.add_field(key, str(value))
+
+        headers = {
+            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'EMPTY')}"
+        }
+
         generated_text = ""
+        ttft = 0.0
         st = time.perf_counter()
         output.start_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
         output.start_time = st
         most_recent_timestamp = st
-        
+
         try:
-            # Read the audio file data first
-            with open(request_input.audio_file_path, 'rb') as f:
-                audio_data = f.read()
-            
-            # Prepare the multipart form data
-            data = aiohttp.FormData()
-            data.add_field('model', 
-                          request_input.model_name if request_input.model_name else request_input.model)
-            
-            if request_input.language:
-                data.add_field('language', request_input.language)
-            
-            data.add_field('temperature', str(request_input.temperature))
-            data.add_field('response_format', request_input.response_format)
-            
-            # Add streaming flag
-            if request_input.stream:
-                data.add_field('stream', 'true')
-            
-            # Add the audio file data
-            data.add_field('file',
-                          audio_data,
-                          filename=os.path.basename(request_input.audio_file_path),
-                          content_type='audio/wav')
-            
-            headers = {
-                "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'EMPTY')}"
-            }
-            
-            async with session.post(url=api_url, data=data,
-                                   headers=headers) as response:
+            async with client_session.post(url=api_url, data=form,
+                                           headers=headers) as response:
                 if response.status == 200:
                     if request_input.stream:
-                        # Streaming mode
-                        first_chunk_received = False
-                        async for line in response.content:
-                            line = line.strip()
-                            if not line:
+                        handler = StreamedResponseHandler()
+                        async for chunk_bytes in response.content.iter_any():
+                            chunk_bytes = chunk_bytes.strip()
+                            if not chunk_bytes:
                                 continue
-                            
-                            line_str = line.decode("utf-8")
-                            
-                            # Handle data: prefix
-                            if line_str.startswith('data: '):
-                                line_str = line_str[len('data: '):]
-                            
-                            # Check for end of stream
-                            if line_str.strip() == '[DONE]':
-                                break
-                            
-                            try:
-                                data_json = json.loads(line_str)
-                                timestamp = time.perf_counter()
-                                
-                                # Extract content from streaming response
-                                if choices := data_json.get("choices"):
-                                    content = choices[0].get('delta', {}).get('content', '')
-                                    
-                                    # First chunk
-                                    if not first_chunk_received and content:
-                                        first_chunk_received = True
-                                        output.ttft = timestamp - st
-                                    # Subsequent chunks
-                                    elif first_chunk_received:
-                                        output.itl.append(timestamp - most_recent_timestamp)
-                                    
-                                    generated_text += content
+
+                            messages = handler.add_chunk(chunk_bytes)
+                            for message in messages:
+                                chunk = message.removeprefix("data: ")
+                                if chunk != "[DONE]":
+                                    timestamp = time.perf_counter()
+                                    data_json = json.loads(chunk)
+                                    if choices := data_json.get("choices"):
+                                        content = choices[0]["delta"].get("content")
+                                        if content:
+                                            if ttft == 0.0:
+                                                ttft = timestamp - st
+                                                output.ttft = ttft
+                                            else:
+                                                output.itl.append(
+                                                    timestamp - most_recent_timestamp
+                                                )
+                                            generated_text += content or ""
+                                    elif usage := data_json.get("usage"):
+                                        output.output_tokens = usage.get(
+                                            "completion_tokens", 0
+                                        )
                                     most_recent_timestamp = timestamp
-                                
-                                # Check for usage info (may come at the end)
-                                elif usage := data_json.get("usage"):
-                                    output.output_tokens = usage.get("completion_tokens", 0)
-                                    
-                            except json.JSONDecodeError:
-                                # Skip malformed JSON lines
-                                continue
-                        
-                        if first_chunk_received:
-                            output.success = True
-                        else:
-                            output.success = False
-                            output.error = "Never received a valid chunk to calculate TTFT."
-                    else:
-                        # Non-streaming mode
-                        result = await response.json()
-                        generated_text = result.get('text', '')
-                        # Note: TTFT doesn't apply to non-streaming mode
-                        # The entire response comes back at once
+
+                        output.transcribed_text = generated_text
                         output.success = True
-                    
-                    output.transcribed_text = generated_text
-                    output.latency = time.perf_counter() - st
+                        output.latency = most_recent_timestamp - st
+                    else:
+                        result = await response.json()
+                        generated_text = result.get("text", "")
+                        output.transcribed_text = generated_text
+                        output.success = True
+                        output.latency = time.perf_counter() - st
                 else:
-                    output.error = f"HTTP {response.status}: {response.reason or ''}"
+                    output.error = response.reason or ""
                     output.success = False
-                        
-        except Exception as e:
+        except Exception:
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
-        
-        return output
+    finally:
+        if form_audio is not None:
+            form_audio.close()
+        if owns_session and client_session is not None:
+            await client_session.close()
+
+    return output
 
 
 class ApiUser(HttpUser):
@@ -254,7 +298,7 @@ async def test_whisper_function():
         request_input = WhisperRequestInput(
             audio_file_path=audio_file_path,
             api_url="http://localhost:8000/v1/audio/transcriptions",
-            model="openai/whisper-small",
+            model="openai/whisper-large-v3",
             language="en",
             temperature=0.0,
             stream=True

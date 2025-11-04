@@ -3,144 +3,148 @@
 Simple test script to verify the async_request_openai_whisper function works.
 """
 import asyncio
+import io
 import os
 import sys
 import tempfile
 import base64
 import wave
+from typing import List
+
+import aiohttp
+import soundfile as sf
 
 # Add the current directory to path to import from whisper_locustfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from whisper_locustfile import async_request_openai_whisper, WhisperRequestInput, generate_random_audio
+from simple_asr_dataset import SimpleASRDataset
 
 
 def create_test_audio_file():
-    """Create a simple test audio file using generate_random_audio from whisper_locustfile."""
-    # Generate 60 seconds of random audio using the existing function
-    base64_audio = generate_random_audio(120000)  # 60000ms = 60 seconds
-    
-    # Decode the base64 audio and save to a temporary file
+    base64_audio = generate_random_audio(120000)
     audio_bytes = base64.b64decode(base64_audio)
-    
-    with tempfile.NamedTemporaryFile(mode='wb', suffix='.wav', delete=False) as tmp_file:
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=".wav", delete=False) as tmp_file:
         tmp_file.write(audio_bytes)
-        audio_path = tmp_file.name
-    
-    # Verify the audio duration
-    with wave.open(audio_path, 'rb') as wav_file:
-        frames = wav_file.getnframes()
-        rate = wav_file.getframerate()
-        duration = frames / float(rate)
-        print(f"Audio file created: {duration:.2f}s ({rate}Hz, {wav_file.getnchannels()} channel(s))")
-    
-    return audio_path
+        return tmp_file.name
+
+
+def extract_audio_array_and_rate(sample: dict):
+    audio_meta = sample.get("audio", {})
+    audio_array = audio_meta.get("array")
+    sampling_rate = audio_meta.get("sampling_rate")
+    audio_path = audio_meta.get("path")
+    audio_bytes = audio_meta.get("bytes")
+
+    if audio_array is None:
+        if audio_bytes is not None:
+            with sf.SoundFile(io.BytesIO(audio_bytes)) as snd_file:
+                audio_array = snd_file.read(dtype="float32")
+                sampling_rate = snd_file.samplerate
+        elif audio_path:
+            audio_array, sampling_rate = sf.read(audio_path)
+        else:
+            raise ValueError(
+                "Dataset sample must include audio bytes, array, or a file path."
+            )
+    elif sampling_rate is None:
+        if audio_bytes is not None:
+            with sf.SoundFile(io.BytesIO(audio_bytes)) as snd_file:
+                sampling_rate = snd_file.samplerate
+        elif audio_path:
+            _audio_array, sampling_rate = sf.read(audio_path)
+        else:
+            raise ValueError("Audio sample missing sampling rate and path.")
+
+    return audio_array, sampling_rate
+
+
+def create_audio_file_from_dataset_sample(sample: dict) -> str:
+    audio_array, sampling_rate = extract_audio_array_and_rate(sample)
+
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=".wav", delete=False) as tmp_file:
+        sf.write(tmp_file.name, audio_array, sampling_rate, format="WAV")
+        return tmp_file.name
+
+
+async def run_streaming_request(idx: int, audio_file_path: str, session: aiohttp.ClientSession):
+    request_input = WhisperRequestInput(
+        audio_file_path=audio_file_path,
+        api_url="http://localhost:8000/v1/audio/transcriptions",
+        model="openai/whisper-large-v3",
+        language="en",
+        temperature=0.0,
+        stream=True,
+    )
+    result = await async_request_openai_whisper(request_input, session=session)
+    return idx, result
 
 
 async def main():
     print("=" * 70)
     print("Testing async_request_openai_whisper Function")
     print("=" * 70)
-    
-    # Create test audio file
-    print("\n[Setup] Creating test audio file...")
-    audio_file_path = create_test_audio_file()
-    print(f"Created audio file: {audio_file_path}")
-    
+
+    print("\n[Setup] Loading sample dataset rows...")
+    dataset = SimpleASRDataset()
+    samples = dataset.sample(sample_size=10)
+    print(f"Loaded {len(samples)} sample rows from {dataset.dataset_path} ({dataset.dataset_split}).")
+
+    if not samples:
+        print("Dataset returned no samples. Exiting.")
+        return
+
+    audio_file_paths: List[str] = []
+    for idx, sample in enumerate(samples):
+        audio_array, sampling_rate = extract_audio_array_and_rate(sample)
+        duration_seconds = len(audio_array) / float(sampling_rate) if sampling_rate else 0.0
+        print(f"Sample {idx}: {len(audio_array)} samples @ {sampling_rate} Hz (~{duration_seconds:.2f}s)")
+        path = create_audio_file_from_dataset_sample(sample)
+        audio_file_paths.append(path)
+        print(f"Saved sample {idx} to temporary WAV: {path}")
+
     try:
-        # Test 1: Streaming mode
-        print("\n" + "=" * 70)
-        print("[TEST 1] Streaming Mode")
-        print("=" * 70)
-        
-        request_input = WhisperRequestInput(
-            audio_file_path=audio_file_path,
-            api_url="http://localhost:8000/v1/audio/transcriptions",
-            model="openai/whisper-large-v3",
-            language="en",
-            temperature=0.0,
-            stream=True
-        )
-        
-        print(f"API URL: {request_input.api_url}")
-        print(f"Model: {request_input.model}")
-        print(f"Language: {request_input.language}")
-        print(f"Stream: {request_input.stream}")
-        print("\nSending request...")
-        
-        result = await async_request_openai_whisper(request_input)
-        
-        print(f"\n✓ Success: {result.success}")
-        if result.success:
-            print(f"  Transcribed Text: '{result.transcribed_text[:100]}...'" if len(result.transcribed_text) > 100 else f"  Transcribed Text: '{result.transcribed_text}'")
-            print(f"  Time to First Token (TTFT): {result.ttft*1000:.4f}ms")
-            print(f"  Total Latency: {result.latency*1000:.4f}ms")
-            print(f"  Inter-token Latencies: {len(result.itl)} chunks")
-            if result.itl:
-                print(f"  Average ITL: {sum(result.itl)/len(result.itl)*1000:.4f}ms")
-                print(f"  Min ITL: {min(result.itl)*1000:.4f}ms")
-                print(f"  Max ITL: {max(result.itl)*1000:.4f}ms")
-        else:
-            print(f"  Error: {result.error}")
-        
-        # Test 2: Non-streaming mode
-        print("\n" + "=" * 70)
-        print("[TEST 2] Non-Streaming Mode")
-        print("=" * 70)
-        
-        request_input_no_stream = WhisperRequestInput(
-            audio_file_path=audio_file_path,
-            api_url="http://localhost:8000/v1/audio/transcriptions",
-            model="openai/whisper-large-v3",
-            language="en",
-            temperature=0.0,
-            stream=False
-        )
-        
-        print(f"API URL: {request_input_no_stream.api_url}")
-        print(f"Model: {request_input_no_stream.model}")
-        print(f"Stream: {request_input_no_stream.stream}")
-        print("\nSending request...")
-        
-        result_no_stream = await async_request_openai_whisper(request_input_no_stream)
-        
-        print(f"\n✓ Success: {result_no_stream.success}")
-        if result_no_stream.success:
-            print(f"  Transcribed Text: '{result_no_stream.transcribed_text[:100]}...'" if len(result_no_stream.transcribed_text) > 100 else f"  Transcribed Text: '{result_no_stream.transcribed_text}'")
-            print(f"  Total Latency: {result_no_stream.latency*1000:.4f}ms")
-            print(f"  (Note: TTFT doesn't apply to non-streaming - entire response arrives at once)")
-        else:
-            print(f"  Error: {result_no_stream.error}")
-        
-        # Summary
-        print("\n" + "=" * 70)
-        print("Summary")
-        print("=" * 70)
-        
-        if result.success or result_no_stream.success:
-            print("\n✓ SUCCESS: At least one mode works!")
-            if result.success and result_no_stream.success:
-                print("  → Both streaming and non-streaming modes work!")
-            elif result.success:
-                print("  → Streaming mode works!")
-                print("  → Non-streaming mode failed (this is OK if not supported)")
-            else:
-                print("  → Non-streaming mode works!")
-                print("  → Streaming mode not supported (falling back to non-streaming)")
-        else:
-            print("\n✗ FAILURE: Both tests failed.")
-            print("\nPlease check:")
-            print("  1. Is the vLLM server running on http://localhost:8000?")
-            print("  2. Is the Whisper model loaded?")
-            print("  3. Check the error messages above for details.")
-        
+        async with aiohttp.ClientSession() as session:
+            sequential_results = []
+            for idx, path in enumerate(audio_file_paths):
+                print("\n" + "=" * 70)
+                print(f"[Sequential] Streaming request for sample {idx}")
+                print("=" * 70)
+                idx_result = await run_streaming_request(idx, path, session)
+                sequential_results.append(idx_result)
+                _, result = idx_result
+                if result.success:
+                    print(f"  TTFT: {result.ttft*1000:.2f} ms | Latency: {result.latency*1000:.2f} ms | Tokens: {result.output_tokens}")
+                else:
+                    print(f"  Error: {result.error}")
+
+            print("\n" + "=" * 70)
+            print("[Batch] Launching streaming requests concurrently")
+            print("=" * 70)
+            batch_results = await asyncio.gather(
+                *(run_streaming_request(idx, path, session) for idx, path in enumerate(audio_file_paths))
+            )
+
+        def summarize(results, label: str):
+            print("\n" + "-" * 70)
+            print(f"Summary: {label}")
+            for idx, res in results:
+                if res.success:
+                    print(f"Sample {idx}: TTFT {res.ttft*1000:.2f} ms, Latency {res.latency*1000:.2f} ms, Tokens {res.output_tokens}")
+                else:
+                    print(f"Sample {idx}: FAILED -> {res.error}")
+
+        summarize(sequential_results, "Sequential")
+        summarize(batch_results, "Batch")
+
     finally:
-        # Clean up
-        if os.path.exists(audio_file_path):
-            os.remove(audio_file_path)
-            print(f"\n[Cleanup] Removed temporary audio file: {audio_file_path}")
+        for path in audio_file_paths:
+            if os.path.exists(path):
+                os.remove(path)
+                print(f"[Cleanup] Removed temporary audio file: {path}")
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
