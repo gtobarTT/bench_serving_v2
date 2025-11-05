@@ -553,7 +553,10 @@ def calculate_metrics(
     # Calculate max output tokens per second and peak concurrent requests
     max_output_tokens_per_s = 0.0
     max_concurrent_requests = 0
+  
+    
     successful_indices = [i for i, o in enumerate(outputs) if o.success]
+    
     if successful_indices:
         min_start_time = min(outputs[i].start_time for i in successful_indices)
         max_end_time = max(outputs[i].start_time + outputs[i].latency
@@ -561,7 +564,6 @@ def calculate_metrics(
         duration_seconds = int(np.ceil(max_end_time - min_start_time)) + 1
         tokens_per_second = np.zeros(duration_seconds)
         concurrent_requests_per_second = np.zeros(duration_seconds)
-
         for i in successful_indices:
             output = outputs[i]
             st = output.start_time
@@ -588,7 +590,9 @@ def calculate_metrics(
         if len(tokens_per_second) > 0:
             max_output_tokens_per_s = float(np.max(tokens_per_second))
             max_concurrent_requests = int(np.max(concurrent_requests_per_second))
-    
+    else:
+        tokens_per_second = np.zeros(int(dur_s))
+        concurrent_requests_per_second = np.zeros(int(dur_s))
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
