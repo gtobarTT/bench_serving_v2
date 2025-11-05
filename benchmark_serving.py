@@ -537,6 +537,50 @@ def calculate_metrics(
             "All requests failed. This is likely due to a misconfiguration "
             "on the benchmark arguments.",
             stacklevel=2)
+    
+    # Calculate max output tokens per second and peak concurrent requests
+    max_output_tokens_per_s = 0.0
+    max_concurrent_requests = 0
+  
+    
+    successful_indices = [i for i, o in enumerate(outputs) if o.success]
+    
+    if successful_indices:
+        min_start_time = min(outputs[i].start_time for i in successful_indices)
+        max_end_time = max(outputs[i].start_time + outputs[i].latency
+                           for i in successful_indices)
+        duration_seconds = int(np.ceil(max_end_time - min_start_time)) + 1
+        tokens_per_second = np.zeros(duration_seconds)
+        concurrent_requests_per_second = np.zeros(duration_seconds)
+        for i in successful_indices:
+            output = outputs[i]
+            st = output.start_time
+            # Token emission timestamps
+            token_times = [st + output.ttft]
+            first_token_time = st + output.ttft
+            current_time = token_times[0]
+            for itl_value in output.itl:
+                current_time += itl_value
+                if current_time > first_token_time: #redundant check
+                    token_times.append(current_time)
+
+            for token_time in token_times:
+                second_bucket = int(token_time - min_start_time)
+                if 0 <= second_bucket < duration_seconds:
+                    tokens_per_second[second_bucket] += 1
+
+            request_start_second = int(st - min_start_time)
+            request_end_second = int((st + output.latency) - min_start_time)
+            for second in range(request_start_second, request_end_second + 1):
+                if 0 <= second < duration_seconds:
+                    concurrent_requests_per_second[second] += 1
+
+        if len(tokens_per_second) > 0:
+            max_output_tokens_per_s = float(np.max(tokens_per_second))
+            max_concurrent_requests = int(np.max(concurrent_requests_per_second))
+    else:
+        tokens_per_second = np.zeros(int(dur_s))
+        concurrent_requests_per_second = np.zeros(int(dur_s))
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,

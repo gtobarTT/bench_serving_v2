@@ -6,8 +6,8 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass, field
-from typing import List, Optional, Union
-
+from typing import Any, List, Optional, Union
+from datetime import datetime,timezone
 import aiohttp
 import huggingface_hub.constants
 from tqdm.asyncio import tqdm
@@ -28,8 +28,10 @@ class RequestFuncInput:
     best_of: int = 1
     logprobs: Optional[int] = None
     extra_body: Optional[dict] = None
+    extra_headers: Optional[dict] = None
     multi_modal_content: Optional[dict] = None
     ignore_eos: bool = False
+    request_id: Optional[str] = None
 
 
 @dataclass
@@ -45,6 +47,64 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
 
+
+
+class StreamedResponseHandler:
+    """Accumulates SSE chunks until complete messages are available."""
+
+    def __init__(self) -> None:
+        self.buffer = ""
+
+    def add_chunk(self, chunk_bytes: bytes) -> List[str]:
+        chunk_str = chunk_bytes.decode("utf-8")
+        self.buffer += chunk_str
+        messages: List[str] = []
+
+        while "\n\n" in self.buffer:
+            message, self.buffer = self.buffer.split("\n\n", 1)
+            message = message.strip()
+            if message:
+                messages.append(message)
+
+        if self.buffer.startswith("data: "):
+            message_content = self.buffer.removeprefix("data: ").strip()
+            if message_content == "[DONE]":
+                messages.append(self.buffer.strip())
+                self.buffer = ""
+            elif message_content:
+                try:
+                    json.loads(message_content)
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    messages.append(self.buffer.strip())
+                    self.buffer = ""
+
+        return messages
+
+
+def _validate_api_url(api_url: str, api_name: str, expected_suffixes: Union[str, List[str], set[str]]) -> None:
+    if isinstance(expected_suffixes, str):
+        expected_suffixes = {expected_suffixes}
+    else:
+        expected_suffixes = set(expected_suffixes)
+    expected_suffixes.add("profile")
+    if not api_url.endswith(tuple(expected_suffixes)):
+        raise ValueError(f"{api_name} URL must end with one of: {expected_suffixes}.")
+
+
+def _update_payload_common(payload: dict[str, Any], request_func_input: RequestFuncInput) -> None:
+    if request_func_input.ignore_eos:
+        payload["ignore_eos"] = request_func_input.ignore_eos
+    if request_func_input.extra_body:
+        payload.update(request_func_input.extra_body)
+
+
+def _update_headers_common(headers: dict[str, Any], request_func_input: RequestFuncInput) -> None:
+    if request_func_input.extra_headers:
+        headers |= request_func_input.extra_headers
+    if request_func_input.request_id:
+        headers["x-request-id"] = request_func_input.request_id
 
 async def async_request_tgi(
     request_func_input: RequestFuncInput,
@@ -236,18 +296,16 @@ async def async_request_openai_completions(
     pbar: Optional[tqdm] = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    assert api_url.endswith(
-        ("completions", "profile")
-    ), "OpenAI Completions API URL must end with 'completions' or 'profile'."
+    _validate_api_url(api_url, "OpenAI Completions API", "completions")
 
     async with aiohttp.ClientSession(trust_env=True,
                                      timeout=AIOHTTP_TIMEOUT) as session:
         payload = {
-            "model": request_func_input.model_name \
-                if request_func_input.model_name else request_func_input.model,
+            "model": (request_func_input.model_name
+                       if request_func_input.model_name else request_func_input.model),
             "prompt": request_func_input.prompt,
             "temperature": 0.0,
-            "best_of": request_func_input.best_of,
+            "repetition_penalty": 1.0,
             "max_tokens": request_func_input.output_len,
             "logprobs": request_func_input.logprobs,
             "stream": True,
@@ -255,13 +313,11 @@ async def async_request_openai_completions(
                 "include_usage": True,
             },
         }
-        if request_func_input.ignore_eos:
-            payload["ignore_eos"] = request_func_input.ignore_eos
-        if request_func_input.extra_body:
-            payload.update(request_func_input.extra_body)
+        _update_payload_common(payload, request_func_input)
         headers = {
-            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"
+            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         }
+        _update_headers_common(headers, request_func_input)
 
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
@@ -274,40 +330,39 @@ async def async_request_openai_completions(
                                     headers=headers) as response:
                 if response.status == 200:
                     first_chunk_received = False
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
+                    handler = StreamedResponseHandler()
+                    async for chunk_bytes in response.content.iter_any():
+                        if not chunk_bytes.strip():
                             continue
 
-                        chunk = chunk_bytes.decode("utf-8").removeprefix(
-                            "data: ")
-                        if chunk != "[DONE]":
+                        messages = handler.add_chunk(chunk_bytes)
+                        for message in messages:
+                            if message.startswith(":"):
+                                continue
+
+                            chunk = message.removeprefix("data: ")
+                            if chunk == "[DONE]":
+                                continue
+
                             data = json.loads(chunk)
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
                             if choices := data.get("choices"):
-                                # Note that text could be empty here
-                                # e.g. for special tokens
                                 text = choices[0].get("text")
                                 timestamp = time.perf_counter()
-                                # First token
                                 if not first_chunk_received:
                                     first_chunk_received = True
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
-
-                                # Decoding phase
+                                    output.ttft = timestamp - st
                                 else:
                                     output.itl.append(timestamp -
                                                       most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
                                 generated_text += text or ""
-                            elif usage := data.get("usage"):
+
+                            if usage := data.get("usage"):
                                 output.output_tokens = usage.get(
                                     "completion_tokens")
+
                     if first_chunk_received:
                         output.success = True
                     else:
