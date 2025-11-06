@@ -12,40 +12,40 @@ from datetime import datetime, timezone
 import numpy as np
 from locust import HttpUser, task
 import base64
-from pydub import AudioSegment
+# from pydub import AudioSegment
 import aiohttp
 import asyncio
 
 
-def generate_random_audio(duration_ms, sample_rate=16000):
-    """
-    Generate random audio data for testing.
+# def generate_random_audio(duration_ms, sample_rate=16000):
+#     """
+#     Generate random audio data for testing.
     
-    Args:
-        duration_ms: Duration in milliseconds
-        sample_rate: Sample rate in Hz (default 16000 for Whisper)
-                    Whisper models expect 16kHz audio
-    """
-    # Generate random data
-    samples = np.random.normal(0, 1, int(sample_rate * duration_ms / 1000.0))
+#     Args:
+#         duration_ms: Duration in milliseconds
+#         sample_rate: Sample rate in Hz (default 16000 for Whisper)
+#                     Whisper models expect 16kHz audio
+#     """
+#     # Generate random data
+#     samples = np.random.normal(0, 1, int(sample_rate * duration_ms / 1000.0))
 
-    # Convert to int16 array so we can make use of the pydub package
-    samples = (samples * np.iinfo(np.int16).max).astype(np.int16)
+#     # Convert to int16 array so we can make use of the pydub package
+#     samples = (samples * np.iinfo(np.int16).max).astype(np.int16)
 
-    # Create an audio segment
-    audio_segment = AudioSegment(
-        samples.tobytes(),
-        frame_rate=sample_rate,
-        sample_width=samples.dtype.itemsize,
-        channels=1
-    )
+#     # Create an audio segment
+#     audio_segment = AudioSegment(
+#         samples.tobytes(),
+#         frame_rate=sample_rate,
+#         sample_width=samples.dtype.itemsize,
+#         channels=1
+#     )
 
-    # Convert the audio segment to a base64 string
-    buffer = io.BytesIO()
-    audio_segment.export(buffer, format="wav")
-    base64_audio = base64.b64encode(buffer.getvalue()).decode('utf-8')
+#     # Convert the audio segment to a base64 string
+#     buffer = io.BytesIO()
+#     audio_segment.export(buffer, format="wav")
+#     base64_audio = base64.b64encode(buffer.getvalue()).decode('utf-8')
 
-    return base64_audio
+#     return base64_audio
 
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
