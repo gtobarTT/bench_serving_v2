@@ -34,7 +34,7 @@ import random
 import time
 import warnings
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime,timezone
 from typing import Any, AsyncGenerator, Collection, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -57,7 +57,7 @@ except ImportError:
     from argparse import ArgumentParser as FlexibleArgumentParser
 
 from benchmark_utils import convert_to_pytorch_benchmark_format
-
+import contextlib
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
 
@@ -89,7 +89,14 @@ class BenchmarkMetrics:
     median_e2el_ms: float
     std_e2el_ms: float
     percentiles_e2el_ms: List[Tuple[float, float]]
-
+    # Additional metrics
+    actual_output_lens: List[int]
+    max_output_tokens_per_s: float
+    max_concurrent_requests: int
+    output_tokens_per_s: List[float]
+    concurrent_requests_per_s: List[int]
+    mean_input_tokens_per_s: float
+    start_timestamps: List[datetime]
 
 def sample_sharegpt_requests(
     dataset_path: str,
@@ -471,7 +478,7 @@ def calculate_metrics(
     selected_percentile_metrics: List[str],
     selected_percentiles: List[float],
     goodput_config_dict: Dict[str, float],
-) -> Tuple[BenchmarkMetrics, List[int]]:
+) -> BenchmarkMetrics:
     actual_output_lens: List[int] = []
     total_input = 0
     completed = 0
@@ -481,6 +488,9 @@ def calculate_metrics(
     all_tpots: List[float] = []
     ttfts: List[float] = []
     e2els: List[float] = []
+    input_tokens_per_s: List[float] = []
+    start_timestamps: List[datetime] = []
+    
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_tokens
@@ -496,6 +506,7 @@ def calculate_metrics(
                               add_special_tokens=False).input_ids)
             actual_output_lens.append(output_len)
             total_input += input_requests[i][1]
+            input_tokens_per_s.append(input_requests[i][1] / outputs[i].ttft)
             tpot = 0
             if output_len > 1:
                 latency_minus_ttft = outputs[i].latency - outputs[i].ttft
@@ -506,6 +517,7 @@ def calculate_metrics(
             itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
             e2els.append(outputs[i].latency)
+            start_timestamps.append(outputs[i].start_timestamp)
             completed += 1
         else:
             actual_output_lens.append(0)
@@ -533,9 +545,8 @@ def calculate_metrics(
                 good_completed += 1
 
     if completed == 0:
-        raise RuntimeError(
-            "All requests failed. This is likely due to a misconfiguration "
-            "on the benchmark arguments.")
+       raise RuntimeError("No successful requests completed during the benchmark. Please check the benchmark arguments or server logs")
+    
     # Calculate max output tokens per second and peak concurrent requests
     max_output_tokens_per_s = 0.0
     max_concurrent_requests = 0
@@ -608,9 +619,16 @@ def calculate_metrics(
         median_e2el_ms=np.median(e2els or 0) * 1000,
         percentiles_e2el_ms=[(p, np.percentile(e2els or 0, p) * 1000)
                              for p in selected_percentiles],
+        actual_output_lens=actual_output_lens,
+        max_output_tokens_per_s=max_output_tokens_per_s,
+        max_concurrent_requests=max_concurrent_requests,
+        output_tokens_per_s=tokens_per_second,
+        concurrent_requests_per_s=concurrent_requests_per_second,
+        mean_input_tokens_per_s= np.mean(input_tokens_per_s),
+        start_timestamps=start_timestamps
     )
 
-    return metrics, actual_output_lens
+    return metrics
 
 
 async def benchmark(
@@ -638,14 +656,16 @@ async def benchmark(
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
-
-    print("Starting initial single prompt test run...")
+    
+    
     test_prompt, test_prompt_len, test_output_len, test_mm_content = (
         input_requests[0])
     if backend != "openai-chat" and test_mm_content is not None:
         # multi-modal benchmark is only available on OpenAI Chat backend.
         raise ValueError(
             "Multi-modal content is only supported on 'openai-chat' backend.")
+    
+    
     test_input = RequestFuncInput(
         model=model_id,
         model_name=model_name,
@@ -658,14 +678,28 @@ async def benchmark(
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
     )
+    if max_concurrency:
+        
+        print(f"Starting initial warmup test run with {max_concurrency} concurrent request(s)...")
+        test_pbar = None if disable_tqdm else tqdm(total=max_concurrency)
+        test_semaphore = (asyncio.Semaphore(max_concurrency)
+                    if max_concurrency else contextlib.nullcontext())
+        
+        async def test_limited_request_func():
+            async with test_semaphore:
+                return await request_func(request_func_input=test_input, pbar=test_pbar)
+                
+        test_tasks = []
+        
+        for _ in range(max_concurrency):
+            test_task = asyncio.create_task(test_limited_request_func())
+            test_tasks.append(test_task)
 
-    test_output = await request_func(request_func_input=test_input)
-    if not test_output.success:
-        raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}")
-    else:
-        print("Initial test run completed. Starting main benchmark run...")
+        _ = await asyncio.gather(*test_tasks)
+
+        if test_pbar is not None:
+            test_pbar.close()
+        print(f"Initial warmup test run completed successfully ({max_concurrency} request(s)). Starting main benchmark run...")
 
     if lora_modules:
         # For each input request, choose a LoRA module at random.
@@ -701,10 +735,11 @@ async def benchmark(
 
     # This can be used once the minimum Python version is 3.10 or higher,
     # and it will simplify the code in limited_request_func.
-    #    semaphore = (asyncio.Semaphore(max_concurrency)
-    #                 if max_concurrency else contextlib.nullcontext())
+    
     semaphore = (asyncio.Semaphore(max_concurrency)
-                 if max_concurrency else None)
+                    if max_concurrency else contextlib.nullcontext())
+    # semaphore = (asyncio.Semaphore(max_concurrency)
+    #              if max_concurrency else None)
 
     async def limited_request_func(request_func_input, pbar):
         if semaphore is None:
@@ -738,7 +773,7 @@ async def benchmark(
                 limited_request_func(request_func_input=request_func_input,
                                      pbar=pbar)))
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
-
+    
     if profile:
         print("Stopping profiler...")
         profile_input = RequestFuncInput(
@@ -759,7 +794,7 @@ async def benchmark(
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
-    metrics, actual_output_lens = calculate_metrics(
+    metrics = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
@@ -768,7 +803,7 @@ async def benchmark(
         selected_percentiles=selected_percentiles,
         goodput_config_dict=goodput_config_dict,
     )
-
+    
     print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):",
@@ -781,11 +816,17 @@ async def benchmark(
     if goodput_config_dict:
         print("{:<40} {:<10.2f}".format("Request goodput (req/s):",
                                         metrics.request_goodput))
+    print("{:<40} {:<10.2f}".format("Input token throughput (tok/s):", 
+                                    metrics.mean_input_tokens_per_s))
     print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):",
-                                    metrics.output_throughput))
+                                    metrics.output_tokens_per_s[np.nonzero(metrics.output_tokens_per_s)].mean()))
+    print("{:<40} {:<10.2f}".format("Peak output token throughput (tok/s):",
+                                    metrics.max_output_tokens_per_s))
+    print("{:<40} {:<10.2f}".format("Concurrent requests:",
+                                    pd.Series(metrics.concurrent_requests_per_s).mode()[0]))
     print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):",
                                     metrics.total_token_throughput))
-
+    
     result = {
         "duration": benchmark_duration,
         "completed": metrics.completed,
@@ -797,11 +838,17 @@ async def benchmark(
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
         "input_lens": [output.prompt_len for output in outputs],
-        "output_lens": actual_output_lens,
+        "output_lens": metrics.actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
+        "max_concurrent_requests": metrics.max_concurrent_requests,
+        "output_tokens_per_s": metrics.output_tokens_per_s.tolist(),
+        "concurrent_requests_per_s": metrics.concurrent_requests_per_s.tolist(),
+        "mean_input_tokens_per_s": metrics.mean_input_tokens_per_s,
+        "start_timestamps": metrics.start_timestamps,
     }
 
     def process_one_metric(
@@ -1050,7 +1097,7 @@ def main(args: argparse.Namespace):
         result_json: Dict[str, Any] = {}
 
         # Setup
-        current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+        current_dt = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         result_json["date"] = current_dt
         result_json["backend"] = backend
         result_json["model_id"] = model_id
@@ -1087,6 +1134,12 @@ def main(args: argparse.Namespace):
             file_name = args.result_filename
         if args.result_dir:
             file_name = os.path.join(args.result_dir, file_name)
+        
+        # Create directory if it doesn't exist
+        result_dir = os.path.dirname(file_name)
+        if result_dir:
+            os.makedirs(result_dir, exist_ok=True)
+        
         with open(file_name, "w", encoding='utf-8') as outfile:
             json.dump(result_json, outfile)
         save_to_pytorch_benchmark_format(args, result_json, file_name)
