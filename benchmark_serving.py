@@ -533,11 +533,9 @@ def calculate_metrics(
                 good_completed += 1
 
     if completed == 0:
-        warnings.warn(
+        raise RuntimeError(
             "All requests failed. This is likely due to a misconfiguration "
-            "on the benchmark arguments.",
-            stacklevel=2)
-    
+            "on the benchmark arguments.")
     # Calculate max output tokens per second and peak concurrent requests
     max_output_tokens_per_s = 0.0
     max_concurrent_requests = 0
