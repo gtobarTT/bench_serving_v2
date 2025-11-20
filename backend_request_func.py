@@ -46,7 +46,8 @@ class RequestFuncOutput:
     tpot: float = 0.0  # avg next-token latencies
     prompt_len: int = 0
     error: str = ""
-
+    start_time: float = 0.0
+    start_timestamp: datetime = datetime.now(timezone.utc)
 
 
 class StreamedResponseHandler:
@@ -133,6 +134,8 @@ async def async_request_tgi(
 
         ttft = 0.0
         st = time.perf_counter()
+        output.start_timestamp = datetime.now(timezone.utc)
+        output.start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(url=api_url, json=payload) as response:
@@ -204,6 +207,7 @@ async def async_request_trt_llm(
 
         ttft = 0.0
         st = time.perf_counter()
+        output.start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(url=api_url, json=payload) as response:
@@ -270,6 +274,7 @@ async def async_request_deepspeed_mii(
         output.ttft = 0
 
         st = time.perf_counter()
+        output.start_time = st
         try:
             async with session.post(url=request_func_input.api_url,
                                     json=payload) as response:
@@ -324,6 +329,8 @@ async def async_request_openai_completions(
 
         generated_text = ""
         st = time.perf_counter()
+        output.start_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+        output.start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(url=api_url, json=payload,
@@ -430,6 +437,7 @@ async def async_request_openai_chat_completions(
         generated_text = ""
         ttft = 0.0
         st = time.perf_counter()
+        output.start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(url=api_url, json=payload,
