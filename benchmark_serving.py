@@ -33,14 +33,15 @@ import os
 import random
 import time
 import warnings
+import aiohttp
 from dataclasses import dataclass
 from datetime import datetime,timezone
-from typing import Any, AsyncGenerator, Collection, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Collection, Dict, Iterable, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from backend_request_func import (ASYNC_REQUEST_FUNCS, RequestFuncInput,
-                                  RequestFuncOutput)
+from backend_request_func import (AIOHTTP_TIMEOUT, ASYNC_REQUEST_FUNCS,
+                                  RequestFuncInput, RequestFuncOutput)
 from datasets import load_dataset
 from PIL.Image import Image
 from tqdm.asyncio import tqdm
@@ -56,7 +57,7 @@ try:
 except ImportError:
     from argparse import ArgumentParser as FlexibleArgumentParser
 
-from benchmark_utils import convert_to_pytorch_benchmark_format
+from benchmark_utils import convert_to_pytorch_benchmark_format, wait_for_endpoint
 import contextlib
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
@@ -426,14 +427,43 @@ def sample_random_requests(
     return input_requests
 
 
+def _get_current_request_rate(
+    ramp_up_strategy: Literal["linear", "exponential"] | None,
+    ramp_up_start_rps: int | None,
+    ramp_up_end_rps: int | None,
+    request_index: int,
+    total_requests: int,
+    request_rate: float,
+) -> float:
+    """Calculate the current request rate based on ramp-up strategy."""
+    if (
+        ramp_up_strategy
+        and ramp_up_start_rps is not None
+        and ramp_up_end_rps is not None
+    ):
+        progress = request_index / max(total_requests - 1, 1)
+        if ramp_up_strategy == "linear":
+            increase = (ramp_up_end_rps - ramp_up_start_rps) * progress
+            return ramp_up_start_rps + increase
+        elif ramp_up_strategy == "exponential":
+            ratio = ramp_up_end_rps / ramp_up_start_rps
+            return ramp_up_start_rps * (ratio**progress)
+        else:
+            raise ValueError(f"Unknown ramp-up strategy: {ramp_up_strategy}")
+    return request_rate
+
+
 async def get_request(
-    input_requests: List[Tuple[str, int, int]],
+    input_requests: List[Tuple[str, int, int, Optional[Dict[str, Any]]]],
     request_rate: float,
     burstiness: float = 1.0,
-) -> AsyncGenerator[Tuple[str, int, int], None]:
+    ramp_up_strategy: Literal["linear", "exponential"] | None = None,
+    ramp_up_start_rps: int | None = None,
+    ramp_up_end_rps: int | None = None,
+) -> AsyncGenerator[Tuple[Tuple[str, int, int, Optional[Dict[str, Any]]], float], None]:
     """
     Asynchronously generates requests at a specified rate
-    with OPTIONAL burstiness.
+    with OPTIONAL burstiness and OPTIONAL ramp-up strategy.
 
     Args:
         input_requests:
@@ -448,26 +478,79 @@ async def get_request(
             A lower burstiness value (0 < burstiness < 1) results
             in more bursty requests, while a higher burstiness value
             (burstiness > 1) results in a more uniform arrival of requests.
+        ramp_up_strategy (optional):
+            The ramp-up strategy. Can be "linear" or "exponential".
+            If None, uses constant request rate (specified by request_rate).
+        ramp_up_start_rps (optional):
+            The starting request rate for ramp-up.
+        ramp_up_end_rps (optional):
+            The ending request rate for ramp-up.
     """
-    input_requests = iter(input_requests)
-
-    # Calculate scale parameter theta to maintain the desired request_rate.
     assert burstiness > 0, (
-        f"A positive burstiness factor is expected, but given {burstiness}.")
-    theta = 1.0 / (request_rate * burstiness)
+        f"A positive burstiness factor is expected, but given {burstiness}."
+    )
+    # Convert to list to get length for ramp-up calculations
+    if isinstance(input_requests, Iterable) and not isinstance(input_requests, list):
+        input_requests = list(input_requests)
 
-    for request in input_requests:
-        yield request
+    total_requests = len(input_requests)
+    assert total_requests > 0, "No requests provided."
 
-        if request_rate == float("inf"):
-            # If the request rate is infinity, then we don't need to wait.
-            continue
+    # Precompute delays among requests to minimize request send laggings
+    request_rates = []
+    delay_ts = []
+    for request_index, request in enumerate(input_requests):
+        current_request_rate = _get_current_request_rate(
+            ramp_up_strategy,
+            ramp_up_start_rps,
+            ramp_up_end_rps,
+            request_index,
+            total_requests,
+            request_rate,
+        )
+        assert current_request_rate > 0.0, (
+            f"Obtained non-positive request rate {current_request_rate}."
+        )
+        request_rates.append(current_request_rate)
+        if current_request_rate == float("inf"):
+            delay_ts.append(0)
+        elif burstiness == float("inf"):
+            # when burstiness tends to infinity, the delay time becomes constant
+            # and tends to the inverse of the request rate
+            delay_ts.append(1.0 / current_request_rate)
+        else:
+            theta = 1.0 / (current_request_rate * burstiness)
 
-        # Sample the request interval from the gamma distribution.
-        # If burstiness is 1, it follows exponential distribution.
-        interval = np.random.gamma(shape=burstiness, scale=theta)
-        # The next request will be sent after the interval.
-        await asyncio.sleep(interval)
+            # Sample the request interval from the gamma distribution.
+            # If burstiness is 1, it follows exponential distribution.
+            delay_ts.append(np.random.gamma(shape=burstiness, scale=theta))
+
+    # Calculate the cumulative delay time from the first sent out requests.
+    for i in range(1, len(delay_ts)):
+        delay_ts[i] += delay_ts[i - 1]
+    if ramp_up_strategy is None and delay_ts[-1] != 0:
+        # When ramp_up_strategy is not set, we assume the request rate is fixed
+        # and all requests should be sent in target_total_delay_s, the following
+        # logic would re-scale delay time to ensure the final delay_ts
+        # align with target_total_delay_s.
+        #
+        # NOTE: If we simply accumulate the random delta values
+        # from the gamma distribution, their sum would have 1-2% gap
+        # from target_total_delay_s. The purpose of the following logic is to
+        # close the gap for stabilizing the throughput data
+        # from different random seeds.
+        target_total_delay_s = total_requests / request_rate
+        normalize_factor = target_total_delay_s / delay_ts[-1]
+        delay_ts = [delay * normalize_factor for delay in delay_ts]
+
+    start_ts = time.time()
+    for request_index, request in enumerate(input_requests):
+        if delay_ts[request_index] > 0:
+            current_ts = time.time()
+            sleep_interval_s = start_ts + delay_ts[request_index] - current_ts
+            if sleep_interval_s > 0:
+                await asyncio.sleep(sleep_interval_s)
+        yield request, request_rates[request_index]
 
 
 def calculate_metrics(
@@ -651,6 +734,7 @@ async def benchmark(
     goodput_config_dict: Dict[str, float],
     max_concurrency: Optional[int],
     lora_modules: Optional[List[str]],
+    ready_check_timeout_sec: int = 600,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -678,220 +762,307 @@ async def benchmark(
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
     )
-    if max_concurrency:
-        
-        print(f"Starting initial warmup test run with {max_concurrency} concurrent request(s)...")
-        test_pbar = None if disable_tqdm else tqdm(total=max_concurrency)
-        test_semaphore = (asyncio.Semaphore(max_concurrency)
-                    if max_concurrency else contextlib.nullcontext())
-        
-        async def test_limited_request_func():
-            async with test_semaphore:
-                return await request_func(request_func_input=test_input, pbar=test_pbar)
-                
-        test_tasks = []
-        
-        for _ in range(max_concurrency):
-            test_task = asyncio.create_task(test_limited_request_func())
-            test_tasks.append(test_task)
-
-        _ = await asyncio.gather(*test_tasks)
-
-        if test_pbar is not None:
-            test_pbar.close()
-        print(f"Initial warmup test run completed successfully ({max_concurrency} request(s)). Starting main benchmark run...")
-
-    if lora_modules:
-        # For each input request, choose a LoRA module at random.
-        lora_modules = iter(
-            [random.choice(lora_modules) for _ in range(len(input_requests))])
-
-    if profile:
-        print("Starting profiler...")
-        profile_input = RequestFuncInput(model=model_id,
-                                         model_name=model_name,
-                                         prompt=test_prompt,
-                                         api_url=base_url + "/start_profile",
-                                         prompt_len=test_prompt_len,
-                                         output_len=test_output_len,
-                                         logprobs=logprobs,
-                                         best_of=best_of,
-                                         multi_modal_content=test_mm_content,
-                                         ignore_eos=ignore_eos)
-        profile_output = await request_func(request_func_input=profile_input)
-        if profile_output.success:
-            print("Profiler started")
-
-    if burstiness == 1.0:
-        distribution = "Poisson process"
-    else:
-        distribution = "Gamma distribution"
-
-    print(f"Traffic request rate: {request_rate}")
-    print(f"Burstiness factor: {burstiness} ({distribution})")
-    print(f"Maximum request concurrency: {max_concurrency}")
-
-    pbar = None if disable_tqdm else tqdm(total=len(input_requests))
-
-    # This can be used once the minimum Python version is 3.10 or higher,
-    # and it will simplify the code in limited_request_func.
-    
-    semaphore = (asyncio.Semaphore(max_concurrency)
-                    if max_concurrency else contextlib.nullcontext())
-    # semaphore = (asyncio.Semaphore(max_concurrency)
-    #              if max_concurrency else None)
-
-    async def limited_request_func(request_func_input, pbar):
-        if semaphore is None:
-            return await request_func(request_func_input=request_func_input,
-                                      pbar=pbar)
-        async with semaphore:
-            return await request_func(request_func_input=request_func_input,
-                                      pbar=pbar)
-
-    benchmark_start_time = time.perf_counter()
-    tasks: List[asyncio.Task] = []
-    async for request in get_request(input_requests, request_rate, burstiness):
-        prompt, prompt_len, output_len, mm_content = request
-        req_model_id, req_model_name = model_id, model_name
-        if lora_modules:
-            req_lora_module = next(lora_modules)
-            req_model_id, req_model_name = req_lora_module, req_lora_module
-
-        request_func_input = RequestFuncInput(model=req_model_id,
-                                              model_name=req_model_name,
-                                              prompt=prompt,
-                                              api_url=api_url,
-                                              prompt_len=prompt_len,
-                                              output_len=output_len,
-                                              logprobs=logprobs,
-                                              best_of=best_of,
-                                              multi_modal_content=mm_content,
-                                              ignore_eos=ignore_eos)
-        tasks.append(
-            asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input,
-                                     pbar=pbar)))
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
-    
-    if profile:
-        print("Stopping profiler...")
-        profile_input = RequestFuncInput(
-            model=model_id,
-            prompt=test_prompt,
-            api_url=base_url + "/stop_profile",
-            prompt_len=test_prompt_len,
-            output_len=test_output_len,
-            logprobs=logprobs,
-            best_of=best_of,
-        )
-        profile_output = await request_func(request_func_input=profile_input)
-        if profile_output.success:
-            print("Profiler stopped")
-
-    if pbar is not None:
-        pbar.close()
-
-    benchmark_duration = time.perf_counter() - benchmark_start_time
-
-    metrics = calculate_metrics(
-        input_requests=input_requests,
-        outputs=outputs,
-        dur_s=benchmark_duration,
-        tokenizer=tokenizer,
-        selected_percentile_metrics=selected_percentile_metrics,
-        selected_percentiles=selected_percentiles,
-        goodput_config_dict=goodput_config_dict,
+    connector = aiohttp.TCPConnector(
+        limit=max_concurrency or 0,
+        limit_per_host=max_concurrency or 0,
+        ttl_dns_cache=300,
+        use_dns_cache=True,
+        keepalive_timeout=60,
+        enable_cleanup_closed=True,
+        force_close=False,
+        ssl=api_url.startswith("https://"),
     )
-    
-    print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
-    print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
-    print("{:<40} {:<10.2f}".format("Benchmark duration (s):",
-                                    benchmark_duration))
-    print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
-    print("{:<40} {:<10}".format("Total generated tokens:",
-                                 metrics.total_output))
-    print("{:<40} {:<10.2f}".format("Request throughput (req/s):",
-                                    metrics.request_throughput))
-    if goodput_config_dict:
-        print("{:<40} {:<10.2f}".format("Request goodput (req/s):",
-                                        metrics.request_goodput))
-    print("{:<40} {:<10.2f}".format("Input token throughput (tok/s):", 
-                                    metrics.mean_input_tokens_per_s))
-    print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):",
-                                    metrics.output_tokens_per_s[np.nonzero(metrics.output_tokens_per_s)].mean()))
-    print("{:<40} {:<10.2f}".format("Peak output token throughput (tok/s):",
-                                    metrics.max_output_tokens_per_s))
-    print("{:<40} {:<10.2f}".format("Concurrent requests:",
-                                    pd.Series(metrics.concurrent_requests_per_s).mode()[0]))
-    print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):",
-                                    metrics.total_token_throughput))
-    
-    result = {
-        "duration": benchmark_duration,
-        "completed": metrics.completed,
-        "total_input_tokens": metrics.total_input,
-        "total_output_tokens": metrics.total_output,
-        "request_throughput": metrics.request_throughput,
-        "request_goodput:":
-        metrics.request_goodput if goodput_config_dict else None,
-        "output_throughput": metrics.output_throughput,
-        "total_token_throughput": metrics.total_token_throughput,
-        "input_lens": [output.prompt_len for output in outputs],
-        "output_lens": metrics.actual_output_lens,
-        "ttfts": [output.ttft for output in outputs],
-        "itls": [output.itl for output in outputs],
-        "generated_texts": [output.generated_text for output in outputs],
-        "errors": [output.error for output in outputs],
-        "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
-        "max_concurrent_requests": metrics.max_concurrent_requests,
-        "output_tokens_per_s": metrics.output_tokens_per_s.tolist(),
-        "concurrent_requests_per_s": metrics.concurrent_requests_per_s.tolist(),
-        "mean_input_tokens_per_s": metrics.mean_input_tokens_per_s,
-        "start_timestamps": metrics.start_timestamps,
-    }
+    session = aiohttp.ClientSession(
+        connector=connector,
+        trust_env=True,
+        timeout=AIOHTTP_TIMEOUT,
+    )
 
-    def process_one_metric(
-        # E.g., "ttft"
-        metric_attribute_name: str,
-        # E.g., "TTFT"
-        metric_name: str,
-        # E.g., "Time to First Token"
-        metric_header: str,
-    ):
-        # This function prints and adds statistics of the specified
-        # metric.
-        if metric_attribute_name not in selected_percentile_metrics:
-            return
-        print("{s:{c}^{n}}".format(s=metric_header, n=50, c='-'))
-        print("{:<40} {:<10.2f}".format(
-            f"Mean {metric_name} (ms):",
-            getattr(metrics, f"mean_{metric_attribute_name}_ms")))
-        print("{:<40} {:<10.2f}".format(
-            f"Median {metric_name} (ms):",
-            getattr(metrics, f"median_{metric_attribute_name}_ms")))
-        result[f"mean_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"mean_{metric_attribute_name}_ms")
-        result[f"median_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"median_{metric_attribute_name}_ms")
-        result[f"std_{metric_attribute_name}_ms"] = getattr(
-            metrics, f"std_{metric_attribute_name}_ms")
-        for p, value in getattr(metrics,
-                                f"percentiles_{metric_attribute_name}_ms"):
-            p_word = str(int(p)) if int(p) == p else str(p)
-            print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):",
-                                            value))
-            result[f"p{p_word}_{metric_attribute_name}_ms"] = value
+    try:
+        # Wait for endpoint to become ready (vLLM style)
+        if ready_check_timeout_sec > 0:
+            test_output = await wait_for_endpoint(
+                request_func,
+                test_input,
+                session,
+                timeout_seconds=ready_check_timeout_sec,
+            )
+            if not test_output.success:
+                raise ValueError(
+                    "Initial test run failed - Please make sure benchmark "
+                    "arguments are correctly specified. "
+                    f"Error: {test_output.error}"
+                )
+            else:
+                print("Initial test run completed.")
+        else:
+            print("Skipping endpoint ready check.")
 
-    process_one_metric("ttft", "TTFT", "Time to First Token")
-    process_one_metric("tpot", "TPOT",
-                       "Time per Output Token (excl. 1st token)")
-    process_one_metric("itl", "ITL", "Inter-token Latency")
-    process_one_metric("e2el", "E2EL", "End-to-end Latency")
+        # if max_concurrency:
+        #     dummy_test = 1
+        #     print(
+        #         f"Starting initial warmup test run with {dummy_test} concurrent request(s)..."
+        #     )
+        #     test_pbar = None if disable_tqdm else tqdm(total=dummy_test)
+        #     test_semaphore = (
+        #         asyncio.Semaphore(dummy_test) if dummy_test else contextlib.nullcontext()
+        #     )
 
-    print("=" * 50)
+        #     async def test_limited_request_func():
+        #         async with test_semaphore:
+        #             return await request_func(
+        #                 request_func_input=test_input,
+        #                 pbar=test_pbar,
+        #                 session=session,
+        #             )
 
-    return result
+        #     test_tasks = []
+
+        #     for _ in range(dummy_test):
+        #         test_task = asyncio.create_task(test_limited_request_func())
+        #         test_tasks.append(test_task)
+
+        #     _ = await asyncio.gather(*test_tasks)
+
+        #     if test_pbar is not None:
+        #         test_pbar.close()
+        #     print(
+        #         f"Initial warmup test run completed successfully ({dummy_test} request(s)). Starting main benchmark run..."
+        #     )
+
+        if lora_modules:
+            # For each input request, choose a LoRA module at random.
+            lora_modules = iter(
+                [random.choice(lora_modules) for _ in range(len(input_requests))]
+            )
+
+        if profile:
+            print("Starting profiler...")
+            profile_input = RequestFuncInput(
+                model=model_id,
+                model_name=model_name,
+                prompt=test_prompt,
+                api_url=base_url + "/start_profile",
+                prompt_len=test_prompt_len,
+                output_len=test_output_len,
+                logprobs=logprobs,
+                best_of=best_of,
+                multi_modal_content=test_mm_content,
+                ignore_eos=ignore_eos,
+            )
+            profile_output = await request_func(
+                request_func_input=profile_input, session=session
+            )
+            if profile_output.success:
+                print("Profiler started")
+
+        if burstiness == 1.0:
+            distribution = "Poisson process"
+        else:
+            distribution = "Gamma distribution"
+
+        print(f"Traffic request rate: {request_rate}")
+        print(f"Burstiness factor: {burstiness} ({distribution})")
+        print(f"Maximum request concurrency: {max_concurrency}")
+
+        pbar = None if disable_tqdm else tqdm(total=len(input_requests))
+
+        semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
+
+        async def limited_request_func(request_func_input, pbar):
+            if semaphore is None:
+                return await request_func(
+                    request_func_input=request_func_input,
+                    pbar=pbar,
+                    session=session,
+                )
+            async with semaphore:
+                return await request_func(
+                    request_func_input=request_func_input,
+                    pbar=pbar,
+                    session=session,
+                )
+
+        benchmark_start_time = time.perf_counter()
+        tasks: List[asyncio.Task] = []
+        async for request, _ in get_request(input_requests, request_rate, burstiness):
+            prompt, prompt_len, output_len, mm_content = request
+            req_model_id, req_model_name = model_id, model_name
+            if lora_modules:
+                req_lora_module = next(lora_modules)
+                req_model_id, req_model_name = req_lora_module, req_lora_module
+
+            request_func_input = RequestFuncInput(
+                model=req_model_id,
+                model_name=req_model_name,
+                prompt=prompt,
+                api_url=api_url,
+                prompt_len=prompt_len,
+                output_len=output_len,
+                logprobs=logprobs,
+                best_of=best_of,
+                multi_modal_content=mm_content,
+                ignore_eos=ignore_eos,
+            )
+            tasks.append(
+                asyncio.create_task(
+                    limited_request_func(
+                        request_func_input=request_func_input,
+                        pbar=pbar,
+                    )
+                )
+            )
+        outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+
+        if profile:
+            print("Stopping profiler...")
+            profile_input = RequestFuncInput(
+                model=model_id,
+                prompt=test_prompt,
+                api_url=base_url + "/stop_profile",
+                prompt_len=test_prompt_len,
+                output_len=test_output_len,
+                logprobs=logprobs,
+                best_of=best_of,
+            )
+            profile_output = await request_func(
+                request_func_input=profile_input, session=session
+            )
+            if profile_output.success:
+                print("Profiler stopped")
+
+        if pbar is not None:
+            pbar.close()
+
+        benchmark_duration = time.perf_counter() - benchmark_start_time
+
+        metrics = calculate_metrics(
+            input_requests=input_requests,
+            outputs=outputs,
+            dur_s=benchmark_duration,
+            tokenizer=tokenizer,
+            selected_percentile_metrics=selected_percentile_metrics,
+            selected_percentiles=selected_percentiles,
+            goodput_config_dict=goodput_config_dict,
+        )
+
+        print("{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
+        print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
+        print(
+            "{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration)
+        )
+        print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
+        print(
+            "{:<40} {:<10}".format("Total generated tokens:", metrics.total_output)
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Request throughput (req/s):", metrics.request_throughput
+            )
+        )
+        if goodput_config_dict:
+            print(
+                "{:<40} {:<10.2f}".format(
+                    "Request goodput (req/s):", metrics.request_goodput
+                )
+            )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Input token throughput (tok/s):", metrics.mean_input_tokens_per_s
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Output token throughput (tok/s):",
+                metrics.output_tokens_per_s[np.nonzero(metrics.output_tokens_per_s)].mean(),
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Peak output token throughput (tok/s):",
+                metrics.max_output_tokens_per_s,
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Concurrent requests:",
+                pd.Series(metrics.concurrent_requests_per_s).mode()[0],
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Total Token throughput (tok/s):", metrics.total_token_throughput
+            )
+        )
+
+        result = {
+            "duration": benchmark_duration,
+            "completed": metrics.completed,
+            "total_input_tokens": metrics.total_input,
+            "total_output_tokens": metrics.total_output,
+            "request_throughput": metrics.request_throughput,
+            "request_goodput:":
+            metrics.request_goodput if goodput_config_dict else None,
+            "output_throughput": metrics.output_throughput,
+            "total_token_throughput": metrics.total_token_throughput,
+            "input_lens": [output.prompt_len for output in outputs],
+            "output_lens": metrics.actual_output_lens,
+            "ttfts": [output.ttft for output in outputs],
+            "itls": [output.itl for output in outputs],
+            "generated_texts": [output.generated_text for output in outputs],
+            "errors": [output.error for output in outputs],
+            "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
+            "max_concurrent_requests": metrics.max_concurrent_requests,
+            "output_tokens_per_s": metrics.output_tokens_per_s.tolist(),
+            "concurrent_requests_per_s": metrics.concurrent_requests_per_s.tolist(),
+            "mean_input_tokens_per_s": metrics.mean_input_tokens_per_s,
+            "start_timestamps": metrics.start_timestamps,
+        }
+
+        def process_one_metric(
+            metric_attribute_name: str,
+            metric_name: str,
+            metric_header: str,
+        ):
+            if metric_attribute_name not in selected_percentile_metrics:
+                return
+            print("{s:{c}^{n}}".format(s=metric_header, n=50, c="-"))
+            print(
+                "{:<40} {:<10.2f}".format(
+                    f"Mean {metric_name} (ms):",
+                    getattr(metrics, f"mean_{metric_attribute_name}_ms"),
+                )
+            )
+            print(
+                "{:<40} {:<10.2f}".format(
+                    f"Median {metric_name} (ms):",
+                    getattr(metrics, f"median_{metric_attribute_name}_ms"),
+                )
+            )
+            result[f"mean_{metric_attribute_name}_ms"] = getattr(
+                metrics, f"mean_{metric_attribute_name}_ms"
+            )
+            result[f"median_{metric_attribute_name}_ms"] = getattr(
+                metrics, f"median_{metric_attribute_name}_ms"
+            )
+            result[f"std_{metric_attribute_name}_ms"] = getattr(
+                metrics, f"std_{metric_attribute_name}_ms"
+            )
+            for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}_ms"):
+                p_word = str(int(p)) if int(p) == p else str(p)
+                print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):", value))
+                result[f"p{p_word}_{metric_attribute_name}_ms"] = value
+
+        process_one_metric("ttft", "TTFT", "Time to First Token")
+        process_one_metric("tpot", "TPOT", "Time per Output Token (excl. 1st token)")
+        process_one_metric("itl", "ITL", "Inter-token Latency")
+        process_one_metric("e2el", "E2EL", "End-to-end Latency")
+
+        print("=" * 50)
+
+        return result
+    finally:
+        await session.close()
 
 
 def check_goodput_args(args):
@@ -1090,6 +1261,7 @@ def main(args: argparse.Namespace):
             goodput_config_dict=goodput_config_dict,
             max_concurrency=args.max_concurrency,
             lora_modules=args.lora_modules,
+            ready_check_timeout_sec=args.ready_check_timeout_sec,
         ))
 
     # Save config and results to json
@@ -1257,6 +1429,14 @@ if __name__ == "__main__":
         "A lower burstiness value (0 < burstiness < 1) results in more "
         "bursty requests. A higher burstiness value (burstiness > 1) "
         "results in a more uniform arrival of requests.",
+    )
+    parser.add_argument(
+        "--ready-check-timeout-sec",
+        type=int,
+        default=600,
+        help="Maximum time in seconds to wait for the endpoint to become ready "
+        "before starting benchmarks. Default is 600 seconds (10 minutes). "
+        "Set to 0 to skip the readiness check.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
